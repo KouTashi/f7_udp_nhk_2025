@@ -7,6 +7,7 @@ F7メイン基板V2向けにピン割り当てを変更済み
 
 TODO: PIDのタイマー割り込み化
 TODO: スレッドの廃止
+FIXME@287: PID関数の呼び出し方法検討中
 
 2024/09/20
 */
@@ -14,8 +15,6 @@ TODO: スレッドの廃止
 #include "EthernetInterface.h"
 #include "QEI.h"
 #include "mbed.h"
-#include "rtos.h"
-#include <cstdint>
 
 //---------------------------QEI---------------------------//
 QEI ENC1(PC_0, PG_1, NC, 2048, QEI::X4_ENCODING);
@@ -37,6 +36,9 @@ X4も可,X4のほうが細かく取れる
 using ThisThread::sleep_for;
 
 void receive(UDPSocket *receiver);
+Ticker ticker;
+void ticker_callback();
+double PID(double target, double error);
 
 //---------------------------ピンの割り当て---------------------------//
 PwmOut MD1P(PA_0);
@@ -85,7 +87,7 @@ double Integral[7];
 double Differential[7];
 double Output[7];
 double rpm_limit;
-double pwm_limit; // PWM出力制限　絶対に消すな
+double pwm_limit; // WARNING: PWM出力制限　絶対に消すな
 //---------------------------For PID---------------------------//
 
 double mdd[9];
@@ -137,14 +139,15 @@ int main() {
 
   printf("Start\n");
 
+  printf("Starting...\n");
+
   // マイコンをネットワークに接続
   if (net.connect() != 0) {
-    printf("Network connection Error (>_<)\n");
+    printf("Network connection Error >_<\n");
     return -1;
   } else {
-    printf("Network connection success (^_^)\n");
+    printf("Network connection success ^_^\nIP:%s\n", myIP);
   }
-
   // UDPソケットをオープン
   udp.open(&net);
 
@@ -169,10 +172,8 @@ int main() {
 
 void receive(UDPSocket *receiver) { // UDP受信スレッド
 
-  using namespace std::chrono;
+  ticker.attach(&ticker_callback, 0.010);
 
-  Timer t; //回転数の計算とPIDで使うためのタイマー
-  t.start();
   SocketAddress source;
   char buffer[64];
 
@@ -185,7 +186,6 @@ void receive(UDPSocket *receiver) { // UDP受信スレッド
   rpm_limit = 120.0; //回転数の上限を設定する。
   pwm_limit =
       0.6; // MDに出力されるデューテー比の上限を設定する。安全装置の役割を持つ
-  //動作に影響するようなら#defineに変更
   //---------------------------PID parameters---------------------------//
 
   while (1) {
@@ -213,7 +213,7 @@ void receive(UDPSocket *receiver) { // UDP受信スレッド
 
         // ptrがNULLの場合エラーが発生するので対処
         if (ptr != NULL) {
-          // printf("%s\n", ptr);
+          ;;
         }
       }
       //---------------------------受信したパケット（文字列）をintに変換---------------------------//
@@ -232,7 +232,6 @@ void receive(UDPSocket *receiver) { // UDP受信スレッド
         // mdp[i] = fabs(data[i]) / 255;
       }
       //---------------------------方向指令と速度指令を分離---------------------------//
-      t.stop(); //タイマーを停止する、回転数の計算とPIDに使う
 
       //---------------------------エンコーダーの値をもとに回転数（RPM）を計算---------------------------//
       Pulse[1] = ENC1.getPulses();
@@ -241,8 +240,6 @@ void receive(UDPSocket *receiver) { // UDP受信スレッド
       Pulse[4] = ENC4.getPulses();
       Pulse[5] = ENC5.getPulses();
       Pulse[6] = ENC6.getPulses();
-      dt = duration_cast<milliseconds>(t.elapsed_time())
-               .count(); // msで前回からの経過時間を取得
 
       for (int i = 1; i <= 6; i++) {
         RPM[i] = 60000.0 / dt * (Pulse[i]) /
@@ -260,42 +257,7 @@ void receive(UDPSocket *receiver) { // UDP受信スレッド
 
       //---------------------------PID---------------------------//
 
-      dt_d =
-          (double)dt /
-          1000000000; // dtをdouble型にキャストする、そのままだと大きすぎるので微小時間にする
-      for (int i = 1; i <= 6; i++) {
-        target[i] = abs((double)data[i]) / rpm_limit;
-        Error[i] = target[i] -
-                   (RPM[i] / rpm_limit); // P制御,目標値と現在値の差分をとる
-        Integral[i] += ((Error[i] + last_Error[i]) * dt_d /
-                        2); // I制御,差分の時間積分、台形で近似して計算
-        Differential[i] =
-            (Error[i] - last_Error[i]) / dt_d; // D制御,差分の時間微分
-
-        last_Error[i] = Error[i];
-        Output[i] +=
-            ((Kp * Error[i]) + (Ki * Integral[i]) +
-             (Kd * Differential[i])); // PID制御,ゲインをかけて足し合わせる
-        mdp[i] = Output[i];
-
-        // WARNING: 安全のためPWMの出力を制限　絶対に消すな
-        if (mdp[i] > pwm_limit) {
-          mdp[i] = pwm_limit;
-        } else if (mdp[1] < 0.0) {
-          mdp[i] = 0.0;
-        }
-        // end
-      }
       //---------------------------PID---------------------------//
-
-      t.reset(); //タイマーをリセット
-      t.start(); //タイマーを開始
-      /*
-      printf("%lf, %lf, %lf, %lf, %lf\n", mdp[1], mdp[2], mdp[3], mdp[4],
-             mdp[5]);*/
-
-      // モーターがうまく回らないときは要調整、短すぎるとPIDがうまく動かず、長すぎるとレスポンスが悪くなる
-      sleep_for(10);
 
       //---------------------------モタドラに出力---------------------------//
 
@@ -320,4 +282,17 @@ void receive(UDPSocket *receiver) { // UDP受信スレッド
       //---------------------------モタドラに出力---------------------------//
     }
   }
+}
+
+void ticker_callback() {
+  // FIXME for文とかでいい感じにするつもり、、、
+  PID();
+}
+
+double PID(double target, double error) {
+
+  double output;
+
+
+  return output;
 }
